@@ -1,0 +1,122 @@
+---
+title: "R Notebook"
+output: html_notebook
+editor_options: 
+  chunk_output_type: console
+---
+
+# Setup
+
+```{r, setup}
+library('pacman')
+
+# Initialisation
+p_load(rstan, bayesplot, ggplot2, coda, circular, moveHMM)
+
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+pal <- c("firebrick","seagreen","navy") # colour palette
+set.seed(1)
+```
+
+# State Transitions
+```{r}
+# Number of states
+N <- 2
+# transition probabilities
+Gamma <- matrix(c(0.9,0.1,0.1,0.9),2,2)
+# initial distribution set to the stationary distribution
+delta <- solve(t(diag(N)-Gamma +1), rep(1, N)) #This calculates the stationary distribution - in the long run, what proportion of time is spent in each state? The formula solves: δ = δΓ (where δΓ means "δ times Gamma")
+# state-dependent Gaussian means
+mu <- c(1,5)
+nobs <- 1000
+S <- rep(NA,nobs)
+y <- rep(NA,nobs)
+# initialise state and observation
+S[1] <- sample(1:N, size=1, prob=delta) # Pick starting state
+y[1] <- rnorm(1, mu[S[1]], 2) # Generate first observation
+# simulate state and observation processes forward
+for(t in 2:nobs) {
+  S[t] <- sample(1:N, size=1, prob=Gamma[S[t-1],]) # Transition
+  y[t] <- rnorm(1, mu[S[t]], 2) # Observe
+}
+
+sim_data <- data.frame(
+  time = 1:nobs,           # x-axis: time points
+  observation = y,         # y-axis: observed values
+  state = factor(S)        # color: hidden state (convert to factor)
+)
+
+ggplot(sim_data, aes(x = time, y = observation, color = state)) +
+  geom_segment(aes(xend = time, yend = 0), 
+               linewidth = 0.8) +  # vertical lines from 0 to observation
+  scale_color_manual(values = c("1" = "firebrick", "2" = "seagreen"),
+                     labels = c("State 1", "State 2")) +
+  labs(title = "Simulated HMM Observations",
+       x = "Time",
+       y = "Observation Value",
+       color = "Hidden State") +
+  theme_minimal()
+
+ggplot(sim_data, aes(x = observation, fill = state)) +
+  geom_density() +
+  scale_fill_manual(values = c("1" = "firebrick", "2" = "seagreen"),
+                     labels = c("State 1", "State 2")) +
+  labs(title = "Simulated HMM Observations",
+       x = "Value",
+       y = "Density",
+       color = "Hidden State") +
+  theme_minimal()
+```
+
+# Stan Model
+```{r}
+stan.data <- list(y = y, T = nobs, N = 2)
+
+fit <- stan(file="HMM_v1.stan", data=stan.data, refresh=2000)
+
+mus <- extract(fit, pars=c("mu"))
+hist(mus[[1]][,1],main="",xlab=expression(mu[1]))
+abline(v=1, col=pal[1], lwd=2)
+hist(mus[[1]][,2],main="",xlab=expression(mu[2]))
+abline(v=5, col=pal[2], lwd=2)
+
+## extract posterior draws
+psam <- extract(fit, pars = c("theta", "mu"))
+## generate new data sets
+n.sims <- dim(psam[[1]])[1]
+n <- length(y)
+# state sequences
+
+ppstates <- matrix(NA, nrow = n.sims, ncol = n)
+# observations
+ppobs <- matrix(NA, nrow = n.sims, ncol = n)
+for (j in 1:n.sims) {
+theta <- psam[[1]][j, , ]
+statdist <- solve(t(diag(N) - theta + 1), rep(1, N))
+ppstates[j, 1] <- sample(1:N, size = 1, prob = statdist)
+ppobs[j, 1] <- rnorm(1, mean = psam[[2]][j, ppstates[j, 1]], sd = 2)
+for (i in 2:length(y)) {
+ppstates[j, i] <- sample(1:N, size = 1, prob = theta[ppstates[j, i -
+1], ])
+ppobs[j, i] <- rnorm(1, mean = psam[[2]][j, ppstates[j, i]], sd = 2)
+}
+}
+
+ppc_dens_overlay(y, ppobs[1:100,])
+
+nlags <- 61
+oac = acf(y[2:(n - 1)], lag.max = (nlags - 1), plot = FALSE)$acf # observed acf
+ppac = matrix(NA, n.sims, nlags)
+for (i in 1:n.sims) {
+ppac[i, ] = acf(ppobs[i, ], lag.max = (nlags - 1), plot = FALSE)$acf
+}
+hpd.acf <- HPDinterval(as.mcmc(ppac), prob = 0.95)
+dat <- data.frame(x = 1:61, acf = as.numeric(oac), lb = hpd.acf[, 1], ub = hpd.acf[,
+2])
+ggplot(dat, aes(x, acf)) + geom_ribbon(aes(x = x, ymin = lb, ymax = ub), fill = "grey70",
+alpha = 0.5) + geom_point(col = "purple", size = 1) + geom_line() + coord_cartesian(xlim = c(2,
+60), ylim = c(-0.1, 0.5)) + xlab("Lag") + ylab("ACF") + ggtitle("Observed Autocorrelation
+Function with 90% CI for ACF of Predicted Quantities")
+```
+
